@@ -7,3 +7,5 @@
 !**/Makefile
 !go.mod
 !go.sum
+
+.idea/.gitignore
