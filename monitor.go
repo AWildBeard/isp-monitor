@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -15,7 +17,7 @@ import (
 )
 
 type packetUpdate struct {
-	dropped   bool
+	received  bool
 	seqNumber int
 	rttStart  time.Time
 	rttStop   time.Time
@@ -52,7 +54,7 @@ func main() {
 	droppedPackets := prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace:   "networkloss",
 		Name:        "dropped_packets",
-		Help:        "Number of dropped packets",
+		Help:        "Number of received packets",
 		ConstLabels: prometheus.Labels{"monitor_target": "1.0.0.1"},
 	})
 
@@ -66,7 +68,7 @@ func main() {
 	packetLossPercentage := prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace:   "networkloss",
 		Name:        "loss_percentage",
-		Help:        "0.0 - 100.0 percentage of dropped packets",
+		Help:        "0.0 - 100.0 percentage of received packets",
 		ConstLabels: prometheus.Labels{"monitor_target": "1.0.0.1"},
 	})
 
@@ -126,7 +128,7 @@ func main() {
 			select {
 			case update := <-updateChan:
 				totalPacketsCounter++
-				if !update.dropped {
+				if update.received {
 					rtt := update.rttStop.Sub(update.rttStart)
 					if rtt < rttMin {
 						rttMin = rtt
@@ -148,6 +150,10 @@ func main() {
 				rttMinFl := float64(0)
 				rttAvgFl := float64(0)
 				rttMaxFl := float64(0)
+
+				if rttMin == time.Duration((1 << 63) - 1) {
+					rttMin = time.Duration(0)
+				}
 
 				rttMinFl = float64(rttMin/time.Microsecond) / 1000
 				rttMinFl += float64(rttMin/time.Millisecond) / 1000
@@ -183,100 +189,136 @@ func main() {
 		}
 	}(updateChan)
 
-	icmpBody := &icmp.Echo{Seq: 0}
-	icmpMessage := icmp.Message{
-		Type: ipv4.ICMPTypeEcho,
-		Code: 0,
-		Body: icmpBody,
-	}
-
-	pingHost := &net.UDPAddr{IP: net.ParseIP("1.0.0.1")}
-	ticker := time.NewTicker(icmpInterval)
-	buf := make([]byte, 1500)
-
 	fmt.Println("opening icmp listener")
-	if con, err := icmp.ListenPacket("udp4", "0.0.0.0"); err == nil {
-		fmt.Println("starting icmp request loop")
-	pingLoop:
-		for {
-			time.Sleep(icmpInterval)
-			if icmpBody.Seq+1 == 65536 {
-				icmpBody.Seq = 0
-			} else {
-				icmpBody.Seq++
-			}
-
-			ticker.Reset(icmpInterval)
-			var (
-				rttStart time.Time
-				rttStop  time.Time
-			)
-
-			if icmpReq, err := icmpMessage.Marshal(nil); err == nil {
-				err = con.SetWriteDeadline(time.Now().Add(icmpInterval))
-				if err != nil {
-					fmt.Printf("fatal error setting write deadling on ping channel: %v. PROGRAM EXIT\n", err)
-					os.Exit(1)
-				}
-
-				if _, err := con.WriteTo(icmpReq, pingHost); err != nil {
-					fmt.Printf("failed to write to host %v: %v\n", pingHost, err)
-					continue pingLoop
-				}
-			} else {
-				fmt.Printf("fatal error marshaling icmp request: %v. PROGRAM EXIT\n", err)
-				os.Exit(1)
-			}
-			rttStart = time.Now()
-
-		readLoop:
-			for {
-				err = con.SetReadDeadline(time.Now().Add(icmpInterval))
-				if err != nil {
-					fmt.Printf("fatal error setting read deadling on ping channel: %v. PROGRAM EXIT\n", err)
-					os.Exit(1)
-				}
-
-				if numBytesReceived, addr, err := con.ReadFrom(buf); err == nil {
-					receivedMessage, receivedMessageError := icmp.ParseMessage(1, buf)
-					rxSeqNum := (int(buf[6]) << 8) | int(buf[7]) // recover the sequence number since icmp doesn't provide access
-					flushBuf(buf, numBytesReceived)
-					if receivedMessageError == nil &&
-						receivedMessage.Type == ipv4.ICMPTypeEchoReply &&
-						addr.String() == pingHost.String() &&
-						icmpBody.Seq == rxSeqNum {
-						break readLoop
-					}
-				}
-
-				select {
-				case <-ticker.C:
-					updateChan <- packetUpdate{
-						dropped:   true,
-						seqNumber: icmpBody.Seq,
-					}
-					continue pingLoop // Time limit for entire ping operation exceeded
-				default:
-					continue readLoop
-				}
-			}
-			rttStop = time.Now()
-
-			updateChan <- packetUpdate{
-				dropped:   false,
-				seqNumber: icmpBody.Seq,
-				rttStart:  rttStart,
-				rttStop:   rttStop,
-			}
-		}
-	} else {
+	con, err := icmp.ListenPacket("udp4", "0.0.0.0")
+	if err != nil {
 		fmt.Printf("fatal error binding to port: %v. PROGRAM EXIT\n", err)
 		os.Exit(1)
 	}
+
+	pingHost := &net.UDPAddr{IP: net.ParseIP("1.0.0.1")}
+	buf := make([]byte, 1500)
+	deadlineExceeded := false
+	for {
+		if deadlineExceeded {
+			deadlineExceeded = false
+		} else {
+			time.Sleep(icmpInterval)
+		}
+
+		ctxt, cncl := context.WithTimeout(context.Background(), icmpInterval)
+		start := time.Now()
+
+		err = sendPing(con, ctxt, pingHost)
+		// This shouldn't happen on a write, as icmp is a connectionless protocol. This means there's something
+		// messed up with our `con` :/
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+				con, err = icmp.ListenPacket("udp4", "0.0.0.0")
+				if err != nil {
+					fmt.Printf("fatal error binding to port: %v!\n", err)
+					os.Exit(1)
+				}
+			} else {
+				fmt.Printf("Unknown error in sendPing: %v\n", err)
+			}
+		}
+
+		received, err := receivePing(con, ctxt, buf, pingHost)
+		// This can happen in the event the network is down. If this happens, we just log it and trust that `received` will be
+		// set to false
+		if err != nil {
+			if ! errors.Is(err, os.ErrDeadlineExceeded) && errors.Is(err, context.DeadlineExceeded) {
+				fmt.Printf("Unknown error in receivePing: %v\n", err)
+			}
+		}
+
+		updateChan <- packetUpdate{
+			received:  received,
+			seqNumber: seq,
+			rttStart:  start,
+			rttStop:   time.Now(),
+		}
+
+		cncl()
+	}
+
 }
 
 func flushBuf(buf []byte, len int) {
 	for pos := 0; pos < len; pos++ {
 		buf[pos] = 0
 	}
+}
+
+var seq = 0
+// sendPing sends a single ICMP request by writing to `con`. If the write takes time, the timeout is controlled by `context`.
+// Context must have a valid deadline set, else sendPing returns os.ErrNoDeadline.
+func sendPing(con *icmp.PacketConn, context context.Context, target *net.UDPAddr) (err error) {
+	deadline := time.Time{}
+	if newDeadline, ok := context.Deadline(); ok {
+		deadline = newDeadline
+	} else {
+		return os.ErrNoDeadline
+	}
+
+	if seq == 65536 {
+		seq = 0
+	}
+	defer func() {seq++}()
+
+	msg := &icmp.Message{
+		Type:     ipv4.ICMPTypeEcho,
+		Code:     0,
+		Body:     &icmp.Echo{Seq: seq},
+	}
+
+	req, err := msg.Marshal(nil)
+	if err != nil {
+		fmt.Printf("fatal error marshaling icmp request: %v!\n", err)
+		os.Exit(1)
+	}
+
+	err = con.SetWriteDeadline(deadline)
+	if err != nil {
+		return err
+	}
+
+	_, err = con.WriteTo(req, target)
+	if err != nil {
+		return err
+	}
+
+	return
+}
+
+func receivePing(con *icmp.PacketConn, context context.Context, rcvBuf []byte, target *net.UDPAddr) (received bool, err error) {
+	deadline := time.Time{}
+	received = false
+
+	if newDeadline, ok := context.Deadline(); ok {
+		deadline = newDeadline
+	} else {
+		return false, os.ErrNoDeadline
+	}
+
+	err = con.SetReadDeadline(deadline)
+	if err != nil {
+		return false, err
+	}
+
+	numBytesReceived, addr, err := con.ReadFrom(rcvBuf)
+	if err == nil {
+		receivedMessage, receivedMessageError := icmp.ParseMessage(1, rcvBuf)
+		rxSeqNum := (int(rcvBuf[6]) << 8) | int(rcvBuf[7]) // recover the sequence number since icmp doesn't provide access
+		flushBuf(rcvBuf, numBytesReceived)
+		if receivedMessageError == nil &&
+			receivedMessage.Type == ipv4.ICMPTypeEchoReply &&
+			addr.String() == target.String() &&
+			seq-1 == rxSeqNum { // seq-1 because seq is always guaranteed to be 1 higher than rxSeqNum because sendPing increments after send
+			return true, nil
+		}
+	}
+
+	return
 }
