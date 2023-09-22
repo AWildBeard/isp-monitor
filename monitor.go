@@ -19,6 +19,7 @@ type hostUpdate struct {
 
 var (
 	statisticResolution time.Duration
+	measurementInterval time.Duration
 	listenAddress       string
 	printVersion        bool
 	monitorTargets      []string
@@ -31,6 +32,8 @@ var (
 func init() {
 	flag.DurationVarP(&statisticResolution, "resolution", "r", 30*time.Second,
 		"set how often this tool generates statistics for observation")
+	flag.DurationVarP(&measurementInterval, "interval", "i", 5*time.Second,
+		"set the interval between ICMP requests")
 	flag.StringVarP(&listenAddress, "listen", "l", "127.0.0.1:9321",
 		"set the listen address for the prometheus metrics server")
 	flag.BoolVarP(&printVersion, "version", "v", false,
@@ -157,7 +160,7 @@ func main() {
 					os.Exit(1)
 				}
 
-				pinger.Interval = 1 * time.Second
+				pinger.Interval = measurementInterval
 				pinger.Timeout = statisticResolution
 				pinger.OnFinish = func(statistics *ping.Statistics) {
 					updateChan <- &hostUpdate{
