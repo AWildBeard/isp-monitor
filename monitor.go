@@ -179,6 +179,6 @@ func main() {
 	}
 
 	fmt.Println("starting http server")
-	fmt.Printf("%v\n", http.ListenAndServe("127.0.0.1:9321", nil))
+	fmt.Printf("%v\n", http.ListenAndServe(listenAddress, nil))
 	os.Exit(1)
 }
