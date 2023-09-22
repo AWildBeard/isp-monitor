@@ -141,7 +141,9 @@ func main() {
 				roundTripMax.WithLabelValues(update.host).Set(float64(update.MaxRtt.Milliseconds()))
 				roundTripDev.WithLabelValues(update.host).Set(float64(update.StdDevRtt.Milliseconds()))
 
-				fmt.Printf("%v\n", *update.Statistics)
+				if debug {
+					fmt.Printf("%v\n", *update.Statistics)
+				}
 			}
 		}
 	}(updateChan)
