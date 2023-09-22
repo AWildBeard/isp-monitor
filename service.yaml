@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: isp-reliability-monitor
+spec:
+  type: ClusterIP
+  selector:
+    app: isp-reliability-monitor
+  ports:
+    - port: 80
+      targetPort: 9321

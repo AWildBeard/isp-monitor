@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: isp-reliability-monitor
+  labels:
+    app: isp-reliability-monitor
+spec:
+  selector:
+    matchLabels:
+      app: isp-reliability-monitor
+  template:
+    metadata:
+      labels:
+        app: isp-reliability-monitor
+    spec:
+      containers:
+        - name: isp-reliability-monitor
+          image: quay.io/awildbeard/isp-reliability-monitor:latest
+          args:
+            - -l
+            - 0.0.0.0:9321
+            - -h
+            - 1.1.1.1,1.0.0.1

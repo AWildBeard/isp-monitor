@@ -8,5 +8,6 @@
 !go.mod
 !go.sum
 !Dockerfile
+!*.yaml
 
 .idea/.gitignore
